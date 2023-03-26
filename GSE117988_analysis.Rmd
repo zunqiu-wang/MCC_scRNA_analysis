@@ -1,0 +1,1429 @@
+---
+title: "gse117988_analysis"
+output: html_document
+date: "2022-12-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(patchwork)
+library(readr)
+library(ggplot2)
+library(RColorBrewer)
+library(cowplot)
+library(viridis)
+```
+
+Step1. Seurat V4.0 read count 
+```{r}
+## 1.1 for loop importing raw data
+# Create each individual Seurat object for every sample
+for (file in c("SRR7722939", "SRR7722940","SRR7722941","SRR7722942")){
+ seurat_data <- Read10X(data.dir = paste0("./rawdata/Rawdata/", file))
+ seurat_obj <- CreateSeuratObject(counts = seurat_data,
+                                  min.cells = 3,
+                                  min.features = 100,
+                                  project = file)
+ assign(file, seurat_obj) # renaem seurat obj with SRR names
+}
+SRR7722939 # 14049 genes and 2113 cells
+SRR7722940 # 12963 genes and 1497 cells
+SRR7722941 # 13655 genes and 4421 cells
+SRR7722942 # 14300 genes and 4440 cells
+
+SRR7722939@meta.data$group <- "PBMC_Pre"
+SRR7722940@meta.data$group <- "PBMC_EarlyD27"
+SRR7722941@meta.data$group <- "PBMC_RespD376"
+SRR7722942@meta.data$group <- "PBMC_ARD614"
+```
+
+```{r}
+## 1.2 merge multiple seurat objs
+# Create a merged Seurat object
+merged_seurat <- merge(x = SRR7722939,
+                      y = c(SRR7722940, SRR7722941,SRR7722942),
+                      add.cell.id = c("Pre", "EarlyD27",
+                                      "RespD376","ARD614"))
+merged_seurat # 15555 genes and 12471 cells
+merged_seurat@meta.data
+# save
+dir.create('./Output')
+write_rds(merged_seurat,file = "./Output/Step1.Raw_input_merged_seurat.rds")
+
+```
+
+```{r}
+mat = list.files('.',pattern = '*PBMC.csv')
+
+library(data.table)
+seurat_data = fread(mat,data.table = F)
+sc_mat <- data.frame(seurat_data)
+
+
+
+pro = mat
+seurat_obj <- CreateSeuratObject(counts = seurat_data,
+                                 min.cells = 3,
+                                 min.features = 100,
+                                 project = paste0(gsub('_raw.expMatrix_PBMC.csv', '', pro), '_PBMC'))
+
+# save as rds
+write_rds(merged_seurat,file = "./Output/Step1.Raw_input_merged_seurat.rds")
+
+```
+
+Step2.Standard pre-processing workflow
+```{r}
+## 一键清空，重新加载数据
+rm(list=ls())
+## 2.加载数据
+pbmc = read_rds(file = "./Output/Step1.Raw_input_merged_seurat.rds")
+```
+
+```{r}
+##2.1 QC
+dir.create('1-QC')
+##2.1.1 Mito %
+# ^MT-
+mito_genes=rownames(pbmc)[grep("^MT-", rownames(pbmc))]
+mito_genes
+
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+head(pbmc@meta.data, 5)
+summary(pbmc@meta.data$percent.mt)
+
+# Visualize QC metrics as a violin plot
+VlnPlot(pbmc,
+       features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+       ncol = 3,
+       group.by = "group")
+
+## 2.1.2 ribo genes percentage
+# ^RP[SL]
+ribo_genes=rownames(pbmc)[grep("^RP[SL]", rownames(pbmc),ignore.case = T)]
+ribo_genes %>% length()
+
+pbmc=PercentageFeatureSet(pbmc, "^RP[SL]",col.name = "percent.ribo")
+summary(pbmc@meta.data$percent.ribo)
+
+## 2.1.3 hb genes percentage
+# ^HB[^(P)]
+hb_genes <- rownames(pbmc)[grep("^HB[^(P)]", rownames(pbmc),ignore.case = T)]
+hb_genes
+
+pbmc=PercentageFeatureSet(pbmc, "^HB[^(P)]", col.name = "percent.hb")
+summary(pbmc@meta.data$percent.hb)
+
+##visualize
+QC_violin = VlnPlot(pbmc,
+       features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.ribo","percent.hb"),
+       ncol = 5,
+       group.by = "group")
+ggsave(plot=QC_violin,filename="./Output/QC_violin.png", width = 20,height = 10)
+## 2.1.4 filter
+pbmc.qc <- subset(pbmc, subset = nFeature_RNA > 250 & nFeature_RNA < 2500 & nCount_RNA> 500 & percent.mt < 15)
+pbmc.qc # After QC: 15555 genes and 11291 cells
+pbmc # Before QC：15555 genes and 12471 cells
+
+#如果需要根据线粒体、核糖体、血红蛋白过滤
+#pbmc.qc <- subset(pbmc, subset = percent.mt < 15 & percent.ribo> 3 & percent.hb < 0.1)
+
+if(T){
+ # Extract counts
+ counts <- GetAssayData(object = pbmc.qc, slot = "counts")
+ 
+ # Output a logical matrix specifying for each gene on whether or not there are more than zero counts per cell
+ nonzero <- counts > 0
+ 
+ # Sums all TRUE values and returns TRUE if more than 10 TRUE values per gene
+ keep_genes <- Matrix::rowSums(nonzero) >= 10
+ 
+ # Only keeping those genes expressed in more than 10 cells
+ pbmc.qc_counts <- counts[keep_genes,]
+ 
+ # Reassign to filtered Seurat object
+ pbmc.qc <- CreateSeuratObject(pbmc.qc_counts, meta.data = pbmc.qc@meta.data)
+}
+pbmc.qc # 13461 genes and 11291 cells
+
+
+```
+2.2 Normalization
+```{r}
+pbmc.qc <- NormalizeData(pbmc.qc)
+
+```
+2.3 findvariablefeature
+```{r}
+pbmc.qc <- FindVariableFeatures(pbmc.qc, selection.method = "vst", nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc.qc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc.qc)
+#标示TOP10的基因
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+#DIY标示感兴趣的基因
+plot3 <- LabelPoints(plot = plot1, points = c("HLA-DPB1","CCL4"), repel = TRUE)
+
+plot2 + plot3
+
+```
+
+2.4 scale
+```{r}
+pbmc.qc <- ScaleData(pbmc.qc, vars.to.regress = "percent.mt", features = rownames(pbmc.qc))
+```
+
+```{r}
+## 3.1 PCA降维
+set.seed(175640)
+pbmc.qc <- RunPCA(pbmc.qc, features = VariableFeatures(object = pbmc.qc))
+pbmc.qc <- RunTSNE(pbmc.qc, dims = 1:10)
+pbmc.qc <- RunUMAP(pbmc.qc, dims = 1:10)
+write_rds(pbmc.qc,file = "./Output/Step2.after.qc_merged_seurat.rds")
+
+pbmc.qc = read_rds('./Output/Step2.after.qc_merged_seurat.rds')
+### 3.2 检查批次效应
+colnames(pbmc.qc@meta.data)
+
+p1.compare=wrap_plots(ncol = 3,
+                     DimPlot(pbmc.qc, reduction = "pca", group.by = "group")+NoAxes()+ggtitle("Before_PCA"),
+                     DimPlot(pbmc.qc, reduction = "tsne", group.by = "group")+NoAxes()+ggtitle("Before_tSNE"),
+                     DimPlot(pbmc.qc, reduction = "umap", group.by = "group")+NoAxes()+ggtitle("Before_UMAP"),
+                     guides = "collect"
+)
+p1.compare
+ggsave(plot=p1.compare,filename="./Output/Step3.Before_inter_sum.png", width = 20,height = 20)
+
+DimPlot(pbmc.qc,
+reduction = "umap", # pca, umap, tsne
+       group.by = "group",
+       label = F,
+       split.by = "group") + ggtitle("Before_UMAP")
+ggsave("./Output/Step3.Before_inter_UMAP.png",units = "cm", width = 40,height = 20)
+
+
+```
+
+```{r}
+install.packages("harmony")
+library(harmony)
+seuratObj <- RunHarmony(pbmc.qc, "orig.ident")
+names(seuratObj@reductions)
+seuratObj <- RunUMAP(seuratObj,  dims = 1:15, 
+                     reduction = "harmony")
+DimPlot(seuratObj,reduction = "umap",label=T ) 
+
+p2.compare=wrap_plots(ncol = 3,
+                     DimPlot(seuratObj, reduction = "pca", group.by = "group")+NoAxes()+ggtitle("After_PCA"),
+                     DimPlot(seuratObj, reduction = "tsne", group.by = "group")+NoAxes()+ggtitle("After_tSNE"),
+                     DimPlot(seuratObj, reduction = "umap", group.by = "group")+NoAxes()+ggtitle("After_UMAP")
+)
+p2.compare
+ggsave("./Output/Step3.After_inter_sum.png",units = "cm", width = 30,height = 20)
+
+p1.compare / p2.compare
+ggsave("./Output/Step3.After_inter_wrap_compare.png",units = "cm", width = 30,height = 20)
+
+sce=seuratObj
+sce <- FindNeighbors(sce, reduction = "harmony",
+                     dims = 1:15) 
+sce.all=sce
+
+saveRDS(sce.all, "sce.all_int.rds")
+
+```
+
+```{r}
+## 4.4 现在让我们对整合后的矩阵进行聚类，看看聚类是如何在两个集合之间分布的：
+for (res in c(0.05, 0.1, 0.2, 0.3, 0.5,0.8,1,1.2)) {
+ # res=0.01
+ print(res)
+ sce.all <- FindClusters(sce.all, resolution = res, algorithm = 1)
+}
+sce.all@meta.data
+#umap可视化
+cluster_umap <- plot_grid(ncol = 4,  
+       DimPlot(sce.all, reduction = "umap", group.by = "RNA_snn_res.0.05", label = T)& NoAxes(),
+       DimPlot(sce.all, reduction = "umap", group.by = "RNA_snn_res.0.1", label = T) & NoAxes(),
+       DimPlot(sce.all, reduction = "umap", group.by = "RNA_snn_res.0.2", label = T)& NoAxes(),
+       DimPlot(sce.all, reduction = "umap", group.by = "RNA_snn_res.0.3", label = T)& NoAxes(),
+       DimPlot(sce.all, reduction = "umap", group.by = "RNA_snn_res.0.5", label = T) & NoAxes(),
+       DimPlot(sce.all, reduction = "umap", group.by = "RNA_snn_res.0.8", label = T) & NoAxes(),
+       DimPlot(sce.all, reduction = "umap", group.by = "RNA_snn_res.1", label = T) & NoAxes(),
+       DimPlot(sce.all, reduction = "umap", group.by = "RNA_snn_res.1.2", label = T) & NoAxes()
+)
+cluster_umap
+ggsave(plot=cluster_umap, filename="./Output/cluster_umap_diff_resolution.png", width = 20, height = 10, dpi = 300)
+
+#balloon plot
+library(gplots)
+tab.1=table(sce.all@meta.data$RNA_snn_res.0.5,sce.all@meta.data$RNA_snn_res.0.8) 
+balloonplot(tab.1)
+
+# clustree plot
+library(clustree)
+p1_tree <- clustree(sce.all) +
+  theme(legend.position = "bottom") + 
+  scale_color_brewer(palette = "Set1") +
+  scale_edge_color_continuous(low = "grey80", high = "red")
+
+p1_tree=clustree(sce.all@meta.data, prefix = "RNA_snn_res.") +
+  theme(axis.text.x = element_text(size=10),
+         axis.title = element_text(size = 20), 
+  	      axis.text.y = element_text(size= 10),
+         legend.title = element_text(size= 20), #change legend title font size
+        legend.text = element_text(size= 14))
+ggsave(plot=p1_tree, filename="./Output/Tree_diff_resolution.png", width = 20, height = 10, dpi = 300)
+```
+
+```{r}
+## 4.5 choose（resolution）
+DimPlot(sce.all, reduction = "umap", group.by = "RNA_snn_res.0.5", label = T)
+sce.all <- SetIdent(sce.all,value = "RNA_snn_res.0.5")
+DimPlot(sce.all,label = T)
+
+## 保存一下
+write_rds(sce.all,file = "./Output/Step3.Intergration_seurat.rds")
+
+```
+
+```{r}
+## 5.1加载数据
+sce.all = read_rds(file = "./Output/Step3.Intergration_seurat.rds")
+DefaultAssay(sce.all) <- "RNA"
+
+```
+
+```{r}
+remotes::install_github("LTLA/celldex")
+library(celldex)
+ref <- HumanPrimaryCellAtlasData() 
+save(ref,file = 'HumanPrimaryCellAtlasData.Rdata')
+rm(ls='ref')
+```
+
+```{r}
+#Step 5.1.1
+#singleR to annotate cell types
+library(devtools)
+# install_github("LTLA/SingleR")
+library(SingleR)
+library(celldex)
+sce_for_SingleR <- GetAssayData(sce.all, slot="data")
+sce_for_SingleR
+load('./HumanPrimaryCellAtlasData.Rdata')
+hpca.se <- ref
+clusters=sce.all@meta.data$RNA_snn_res.0.5
+#customized umap and tsne plots
+source('./add_corner_axis.R')
+
+#visulaize unannoted cluster plots with umap and tsne at res=0.5
+tsne.immune.ori <- AddCornerAxes(sce.all, reduction = "tsne", group.by = "RNA_snn_res.0.5") +
+  scale_color_discrete(name = 'cluster') +
+  ggtitle("TSNE plot of unannotated clusters")
+umap.immune.ori <- AddCornerAxes(sce.all, reduction = "umap", group.by = "RNA_snn_res.0.5") +
+  scale_color_discrete(name = 'cluster') +
+  ggtitle("UMAP plot of unannotated clusters")
+
+pred.hesc <- SingleR(test = sce_for_SingleR, ref = hpca.se, labels = hpca.se$label.main,
+                     clusters = clusters, 
+                     assay.type.test = "logcounts", assay.type.ref = "logcounts")
+table(pred.hesc$labels)
+celltype = data.frame(ClusterID=rownames(pred.hesc), celltype=pred.hesc$labels, stringsAsFactors = F) 
+write.table(celltype, './singler.anno.immune.csv',sep='')
+sce.all@meta.data$singleR=celltype[match(clusters,celltype$ClusterID),'celltype']
+
+#create cell type singler table
+immune.anno.df <- as.data.frame(sort(table(sce.all$singleR)))
+immune.anno.df$Var1 <- factor(immune.anno.df$Var1,levels = as.character(immune.anno.df$Var1[order(immune.anno.df$Freq,decreasing=F)]))
+
+#visulaize singler with umap and tsne
+
+singler.tsne <- AddCornerAxes(sce.all, reduction = "tsne", group.by = "singleR") +
+  scale_color_discrete(name = 'cluster', labels = paste0(immune.anno.df$Var1, ": N=", immune.anno.df$Freq)) +
+  ggtitle(paste0("TSNE Single R total Immune Cells:", sum(immune.anno.df$Freq)))
+
+singler.umap <- AddCornerAxes(sce.all, reduction = "umap", group.by = "singleR") +
+  scale_color_discrete(name = 'cluster', labels = paste0(immune.anno.df$Var1, ": N=", immune.anno.df$Freq)) +
+  ggtitle(paste0("UMAP Single R total Immune Cells:", sum(immune.anno.df$Freq)))
+
+comb.immune.umap <- umap.immune.ori + singler.umap
+ggsave(plot=comb.immune.umap, filename='./3-immune_clust/immune.cell.subcluster.umap.png', width = 20, height = 10, dpi = 300)
+comb.immune.tsne <- tsne.immune.ori + singler.tsne
+ggsave(plot=comb.immune.tsne, filename='./3-immune_clust/immune.cell.subcluster.tsne.png', width = 20, height = 10, dpi = 300)
+
+#bar plot for each cluster count
+immune.anno.df.bar <-  ggplot(data=immune.anno.df, aes(x=Var1, y=Freq, fill = Var1)) +
+      geom_bar(stat="identity") + coord_flip() +
+  theme(legend.position = "bottom") + xlab("cluster") +
+  ylab("count") +
+   scale_fill_discrete(name = 'cluster', labels = paste0(immune.anno.df$Var1, ": N=", immune.anno.df$Freq)) +
+   ggtitle('Immune cell subcluster singleR') + 
+   guides(colour = guide_legend(override.aes = list(size=3))) +
+   theme(axis.text.x = element_text(size=15, vjust = 1, hjust=1),
+         axis.title = element_text(size = 20), 
+  	      axis.text.y = element_text(size=15)) +
+  	theme(plot.title = element_text(hjust=0, face="bold", size = 30))
+ggsave(plot=immune.anno.df.bar, filename='./immune.cell.subcluster.bar.singler.count.png', width = 20, height = 10, dpi = 300)
+
+save(sce.all,file = '.Output/Immune_subtypes_Seurat_object_by_singleR.Rdata')
+
+```
+
+```{r}
+## 5.2 marker genes
+markerGenes <- c("CD3D", # 定位T细胞
+                "CD3E", # 定位T细胞
+                "TRAC", # 定位T细胞
+                "IL7R", # CD4 T cells
+                "GZMA", # NK T /效应T
+                "NKG7", # NK T cells
+                'KLRD1', # natural killer (NK) cells
+                "CD8B", # CD8 T cells
+                "CD68",
+                "CD163",#mono and mac
+                "FCGR3A", # CD16(FCGR3A)+ Mono / NK / 效应 CD8+ T
+                "CD14", # CD14+ monocyte
+                "LYZ", #Mono
+                "MS4A1", #B细胞
+                "FCER1A","LILRA4","TPM2", #DC
+                "PPBP","GP1BB",# platelets
+                'PTPRC' # immune cells
+              )
+source('stacked_vlnplot.R')
+p1 = StackedVlnPlot(sce.all, features = markerGenes) + 
+  theme(axis.text.x = element_text(size=20, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 30)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold", size = 30)) +
+  ggtitle('Violin Plot of Marker Gene expression for each Cell Cluster')
+ggsave(p1, filename = "./Output/stacked_violin_plot_by_cell_marker.png",width = 20, height = 10, dpi = 300)
+p2 = DotPlot(sce.all, features = markerGenes, dot.scale = 8) + RotatedAxis()
+p3 = FeaturePlot(sce.all,
+           features = markerGenes,
+           label.size = 4,
+           repel = T,label = T)&
+ theme(plot.title = element_text(size=10))&
+ scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "Spectral"))) ##更改配色
+
+## 5.3 根据markers重新命名clusters
+celltype=data.frame(ClusterID=0:13,celltype='NA')
+celltype[celltype$ClusterID %in% c(1),2]='B cells'
+celltype[celltype$ClusterID %in% c(0),2]='NK cells'
+celltype[celltype$ClusterID %in% c(4,5),2]='CD8+ Effector T cells'
+celltype[celltype$ClusterID %in% c(10),2]='CD8+ cytotoxic T cells'
+celltype[celltype$ClusterID %in% c(9),2]='Naive/memory T cells'
+celltype[celltype$ClusterID %in% c(2),2]='CD4+ T cells'
+celltype[celltype$ClusterID %in% c(11),2]='Dendritic cells'
+celltype[celltype$ClusterID %in% c(3,8),2]='CD14+ monocyte'
+celltype[celltype$ClusterID %in% c(7),2]='CD16+ monocyte'  
+celltype[celltype$ClusterID %in% c(9),2]='Platelets'
+celltype[celltype$ClusterID %in% c(6,12,13),2]='Unknown'
+celltype
+
+sce.all@meta.data$celltype = "NA"
+for(i in 1:nrow(celltype)){
+sce.all@meta.data[which(sce.all@active.ident == celltype$ClusterID[i]),'celltype'] <- celltype$celltype[i]}
+table(sce.all@meta.data$celltype)
+
+#compare cell type results
+balloonplot(table(sce.all@meta.data$celltype,sce.all@meta.data$singleR)) 
+
+## 5.4 可视化
+sce.all = SetIdent(sce.all, value = "celltype")
+wrap_plots(ncol = 2,
+          DimPlot(sce.all, reduction = "umap", label = T,repel = T),
+          DimPlot(sce.all, reduction = "tsne", label = T,repel = T),
+          guides = "collect"
+)
+ggsave(filename = "Output/Step5.annotation_plot.pdf",
+      width = 9,height = 17)
+
+## 保存
+write_rds(sce.all,file = "Output/Step5.annotation_pbmc.rds")
+```
+
+```{r}
+#filter out non immune cells
+cells.use <- row.names(sce.all@meta.data)[which(!sce.all@meta.data$celltype %in% c('Unknown','Platelets'))]
+length(cells.use)
+sce.all.immune <-subset(sce.all, cells=cells.use)  
+unique(sce.all.immune@meta.data$celltype)
+
+sce.all.immune <- NormalizeData(sce.all.immune, normalization.method = "LogNormalize", scale.factor = 1e4) 
+sce.all.immune <- FindVariableFeatures(sce.all.immune, selection.method = 'vst', nfeatures = 2000)
+sce.all.immune <- ScaleData(sce.all.immune, vars.to.regress = "percent.mt")
+sce.all.immune <- RunPCA(sce.all.immune) 
+
+## 保存
+write_rds(sce.all.immune,file = "Output/Step6.annotation_pbmc_immune.rds")
+
+```
+
+```{r}
+#create cell type table
+immune.anno.df <- as.data.frame(table(sce.all.immune$celltype))
+immune.anno.df$Var1 <- factor(immune.anno.df$Var1,levels = as.character(immune.anno.df$Var1[order(immune.anno.df$Freq,decreasing=F)]))
+
+#visulaize with umap and tsne
+
+celltype.tsne <- AddCornerAxes(sce.all.immune, reduction = "tsne", group.by = "celltype") +
+  scale_color_discrete(name = 'cluster', labels = paste0(immune.anno.df$Var1, ": N=", immune.anno.df$Freq)) +
+  ggtitle(paste0("TSNE total Immune Cells:", sum(immune.anno.df$Freq)))
+
+celltype.umap <- AddCornerAxes(sce.all.immune, reduction = "umap", group.by = "celltype") +
+  scale_color_discrete(name = 'cluster', labels = paste0(immune.anno.df$Var1, ": N=", immune.anno.df$Freq)) +
+  theme(axis.text.x = element_text(size=10, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 20), 
+  	      axis.text.y = element_text(size= 10),
+         legend.title = element_text(size= 20), #change legend title font size
+        legend.text = element_text(size= 14)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold", size = 30)) +
+  ggtitle(paste0("UMAP total Immune Cells:", sum(immune.anno.df$Freq)))
+
+comb.immune.umap <- umap.immune.ori + celltype.umap
+ggsave(plot=comb.immune.umap, filename='./3-immune_clust/immune.cell.subcluster.umap.png', width = 20, height = 10, dpi = 300)
+comb.immune.tsne <- tsne.immune.ori + celltype.tsne
+ggsave(plot=comb.immune.tsne, filename='./3-immune_clust/immune.cell.subcluster.tsne.png', width = 20, height = 10, dpi = 300)
+
+#stacked bar plot by cell type components per treatment group(change of immune fraction)
+load('./Output/Step6.annotation_pbmc_immune.rds')
+immune_counts <- FetchData(sce.all.immune, vars= c('celltype', 'group'))
+immune.cell.type.counts.df <- as.data.frame(table(immune_counts$celltype))
+stacked.bar.immune.cell <- ggplot(data = immune_counts, aes(x = group, fill = celltype)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_reverse() +
+  theme(legend.position = "bottom") + xlab("treatment group") +
+  ylab("percentage") +
+   scale_fill_discrete(name = 'cell type', labels = paste0(immune.cell.type.counts.df$Var1, ": N=", immune.cell.type.counts.df$Freq)) +
+   ggtitle('stacked bar plot by cell type components per treatment time point') + 
+   guides(colour = guide_legend(override.aes = list(size=3))) +
+   theme(axis.text.x = element_text(size=20, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 30), 
+  	      axis.text.y = element_text(size= 20),
+         legend.title = element_text(size= 30), #change legend title font size
+        legend.text = element_text(size= 20)) +
+  	theme(plot.title = element_text(hjust=0, face="bold", size = 30))
+ggsave(stacked.bar.immune.cell, filename = "./3-immune_clust/stacked_bar_plot_by_cell_type_components_per_treatment_time_point.png",width = 20, height = 10, dpi = 300)
+
+immune_counts %>%
+  filter(analysis == "naive") %>%
+  ggplot(aes(x = biopsy_site, fill = singleR)) +
+  geom_bar(position = "fill") +
+  # scale_fill_manual(values = ) +
+  coord_flip() +
+  scale_y_reverse()
+
+```
+
+```{r}
+#Stacked violin plot of marker gens acroess cell types
+
+stacked.vln_plot = StackedVlnPlot(sce.all.immune, features = markerGenes) + 
+  theme(axis.text.x = element_text(size=10, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 20)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold", size = 30)) +
+  ggtitle('Violin Plot of Marker Gene expression for each Cell Types')
+ggsave(stacked.vln_plot, filename = "./3-immune_clust/stacked_violin_plot_cellmarker_per_cell_type.png",width = 20, height = 10, dpi = 300)
+```
+
+```{r}
+## marker genes exp by cluster dotplot faceted by tissue origin
+#plot_layer
+#findallmarkers
+#jjanno
+
+#remotes::install_github('immunogenomics/presto', force = T)
+library(presto)
+#run marker genes differential expression based on wilcox
+markers<- presto::wilcoxauc(sce.all.immune, 'celltype', assay = 'data')
+markers<- top_markers(markers, n = 6, auc_min = 0.5, pct_in_min = 20, pct_out_max = 20)
+all_markers <- markers %>%
+  dplyr::select(-rank) %>% 
+  unclass() %>% 
+  stack() %>%
+  pull(values) %>%
+  unique() %>%
+   .[!is.na(.)]
+
+
+dot.group <- DotPlot(sce.all.immune, features = all_markers, group.by = 'celltype') + facet_grid(~ unique(sce.all.immune@meta.data$group)) + coord_flip() + 
+  theme(axis.text.x = element_text(size=20, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 30), 
+  	      axis.text.y = element_text(size= 20),
+         legend.title = element_text(size= 30), #change legend title font size
+        legend.text = element_text(size= 20),
+        strip.text.x = element_text(size = 20)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold", size = 30)) +
+  ggtitle('Marker genes expression dotplot')
+ggsave(plot=dot.group, filename='./3-immune_clust/marker_gene_exp_of_each_cell_type_across_different_conditions.png', width = 20, height = 15, dpi = 300)
+
+## inferred that marker gene exp dont much vary across tissue type
+
+save(sce.all.immune,file = './Output/Immune_subtypes_Seurat_object_by_cannanical.rds')
+```
+
+```{r}
+# heat map with selected marker genes for each cell type
+library(ComplexHeatmap)
+markers<- presto::wilcoxauc(sce.all.immune, 'celltype', assay = 'data')
+markers.small<- top_markers(markers, n = 10, auc_min = 0.5, pct_in_min = 20, pct_out_max = 20)
+all_markers <- markers.small %>%
+  dplyr::select(-rank) %>% 
+  unclass() %>% 
+  stack() %>%
+  pull(values) %>%
+  unique() %>%
+   .[!is.na(.)]
+
+all_markers.small <- markers.small %>%
+  dplyr::select(-rank) %>% 
+  unclass() %>% 
+  stack() %>% data.frame() %>% group_by(ind) %>% dplyr::slice(1:3) %>%
+  pull(values) %>%
+  unique() %>%
+   .[!is.na(.)]
+length(all_markers.small)
+
+p<- DotPlot(object = sce.all.immune, features = all_markers, group.by = 'celltype')
+
+#get dotplot data
+dot.df <- p$data
+# dot.df$celltype <- unlist(lapply(regmatches(as.character(dot.df$id), regexpr("_", as.character(dot.df$id)), invert = TRUE), '[[',1))
+# dot.df$group <- unlist(lapply(regmatches(as.character(dot.df$id), regexpr("_", as.character(dot.df$id)), invert = TRUE), '[[',2))
+
+
+metadata_heatmap <- dot.df  %>% 
+  filter(id %in% colnames(exp_mat)) %>% 
+  dplyr::select(id) %>% 
+  mutate(id=factor(id, levels=colnames(exp_mat))) %>% 
+  arrange(id)
+
+
+### the matrix for the scaled expression 
+library(tidyr)
+exp_mat<-dot.df %>% 
+  dplyr::select(-pct.exp, -avg.exp) %>%  
+  pivot_wider(names_from = id, values_from = avg.exp.scaled) %>% 
+  as.data.frame() 
+
+row.names(exp_mat) <- exp_mat$features.plot  
+exp_mat <- exp_mat[,-1] %>% as.matrix()
+dim(exp_mat)
+head(exp_mat)
+
+
+col_fun = circlize::colorRamp2(c(-1, 0, 3), viridis(20)[c(1,10, 20)])
+
+# cluster_anno<- sce.all.filt.immune@meta.data$'singleR'
+dim(exp_mat)
+gene_pos <- which(rownames(exp_mat) %in% all_markers.small)
+length(gene_pos)
+row_anno <-  rowAnnotation(all_markers.small = anno_mark(at = gene_pos, 
+                                     labels = all_markers.small))
+
+ttxx <- colorRampPalette(brewer.pal(4,"Paired"))(length(levels(as.factor(colnames(exp_mat)))))
+names(ttxx) <- colnames(exp_mat)
+
+column_ha<- HeatmapAnnotation(
+  celltype = colnames(exp_mat),
+  col = list(celltype = ttxx
+  ),
+  na_col = "grey"
+)
+
+# install.packages('magick')
+hp1 <- Heatmap(exp_mat, name = "Expression",  
+        top_annotation = column_ha,
+        column_title = "Heatmap top marker genes for each cell type ",
+        column_title_gp = gpar(fontsize = 40),
+        column_names_gp = gpar(fontsize = 20),
+        cluster_columns = TRUE,
+        show_column_dend = T,
+        cluster_column_slices = TRUE,
+        column_gap = unit(0.5, "mm"),
+        cluster_rows = TRUE,
+        show_row_dend = FALSE,
+        show_row_names = FALSE,
+        col = col_fun,
+        row_names_gp = gpar(fontsize = 20),
+        # column_title_rot = 90,
+        # top_annotation = HeatmapAnnotation(foo = anno_block(gp = gpar(fill = scales::hue_pal()(9)))),
+        right_annotation = row_anno,
+        show_column_names = T,
+        use_raster = TRUE,
+         row_km = 8,
+        raster_quality = 4)
+pdf('./3-immune_clust/top10.sce.markers_heatmap_23_marked.pdf', width = 20, height = 10)
+ draw(hp1)
+ dev.off()
+
+ 
+ png('./3-immune_clust/top10.sce.markers_heatmap_24_marked.png', width = 20, height = 25, res= 150, units = 'in')
+ draw(hp1)
+ dev.off()
+```
+```{r}
+sce.all.immune@meta.data$group <- as.factor(sce.all.immune@meta.data$group)
+dot.treat <- DotPlot(sce.all.immune, features = all_markers.small, group.by = 'celltype') + 
+  facet_grid(~ unique(sce.all.immune@meta.data$group)) + coord_flip() + 
+  theme(axis.text.x = element_text(size=10, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 20), 
+  	      axis.text.y = element_text(size= 10),
+         legend.title = element_text(size= 20), #change legend title font size
+        legend.text = element_text(size= 14))+
+  	theme(plot.title = element_text(hjust=0.5, face="bold", size = 30)) +
+  ggtitle('Marker genes expression dotplot across treatment time point')
+ggsave(plot=dot.treat, filename='./3-immune_clust/marker_gene_exp_of_each_cell_type_across_different_treatments.png', width = 20, height = 10, dpi = 300)
+
+```
+
+
+
+```{r}
+# Average heat map by top 10 marker genes of each cell type plot
+library(scRNAtoolVis)
+annoGene <- markers.small %>%
+  dplyr::select(-rank) %>% 
+  unclass() %>% 
+  stack() %>% data.frame() %>% group_by(ind) %>% dplyr::slice(1:3) %>%
+  pull(values) %>%
+  unique() %>%
+   .[!is.na(.)]
+markGenes <- annoGene
+avg_heat <- AverageHeatmap(object = sce.all.immune,
+               markerGene = all_markers,
+               markGenes = annoGene)
+png('./3-immune_clust/top10.sce.markers_avgheatmap_24_marked.png', width = 20, height = 10, res= 150, units = 'in')
+draw(avg_heat)
+dev.off()
+
+png('./3-immune_clust/top10.sce.markers_avgheatmap_24_marked.png', width = 20, height = 10, res= 150, units = 'in')
+ draw(avg_heat)
+ dev.off()
+```
+
+```{r}
+#clustered dotplot with gene markers shown for each cell type
+
+## note for grid.points, use col for the filling color of the points, while in grid.circle, use fill for the filling color of the circle. I should learn more about {grid}
+
+## the matrix for the percentage of cells express a gene
+
+percent_mat<-dot.df %>% 
+  dplyr::select(-avg.exp, -avg.exp.scaled) %>%  
+  pivot_wider(names_from = id, values_from = pct.exp) %>% 
+  as.data.frame() 
+    
+row.names(percent_mat) <- percent_mat$features.plot  
+percent_mat <- percent_mat[,-1] %>% as.matrix()
+
+head(percent_mat)
+
+## any value that is greater than 2 will be mapped to yellow
+col_fun = circlize::colorRamp2(c(-1, 0, 2), viridis(20)[c(1,10, 20)])
+
+
+layer_fun2 = function(j, i, x, y, w, h, fill){
+          grid.rect(x = x, y = y, width = w, height = h, 
+                    gp = gpar(col = NA, fill = NA))
+          grid.points(x = x, y = y, 
+                     gp = gpar(col = col_fun(pindex(exp_mat, i, j))),
+                     size = pindex(percent_mat, i, j)/100 * unit(4, "mm"),
+                     pch = 16
+                    )
+}
+
+
+lgd_list2 = list(
+    Legend( labels = c(0,0.25,0.5,0.75,1), title = "pt", type = "points", pch = 16, size = c(0,0.25,0.5,0.75,1) * unit(4,"mm"),
+        legend_gp = gpar(col = "black")))
+
+# cluster_anno<-  sce.all.filt.immune@meta.data$'singleR'
+
+column_ha<- HeatmapAnnotation(
+    celltype = colnames(exp_mat),
+    col = list(celltype = setNames(brewer.pal(8, "Paired"), colnames(exp_mat))
+    ),
+    na_col = "grey"
+)
+
+set.seed(123)
+hp2<- Heatmap(exp_mat,
+        heatmap_legend_param=list(title="expression"),
+        column_title = "Dotplot top marker genes for each cell type", 
+        col=col_fun,
+        rect_gp = gpar(type = "none"),
+        layer_fun = layer_fun2,
+        row_names_gp = gpar(fontsize = 15),
+        border = "black",
+        top_annotation = column_ha,
+        cluster_columns = TRUE,
+        cluster_column_slices = TRUE,
+        column_title_gp = gpar(fontsize = 40, fontface = "bold"),
+        column_names_gp = gpar(fontsize = 20),
+        column_gap = unit(0.5, "mm"),
+        cluster_rows = TRUE,
+        show_row_names = TRUE,
+         row_km = 8)
+
+hp2 <- draw( hp2, annotation_legend_list = lgd_list2)
+pdf('./3-immune_clust/top10.sce.markers_cluster_dotplot.pdf', width = 20, height = 15)
+ draw(hp2)
+ dev.off()
+
+ png('./3-immune_clust/top10.sce.markers_cluster_dotplot.png',  width = 20, height = 15, res= 150, units = 'in')
+ draw(hp2)
+ dev.off()
+ 
+# clustered dotplot with selected top gene markers shown for each cell type
+hp3<- Heatmap(exp_mat,
+        heatmap_legend_param=list(title="expression"),
+        column_title = "Dotplot marked marker genes for each cell type", 
+        col=col_fun,
+        rect_gp = gpar(type = "none"),
+        layer_fun = layer_fun2,
+        row_names_gp = gpar(fontsize = 15),
+        border = "black",
+        top_annotation = column_ha,
+        cluster_columns = TRUE,
+        cluster_column_slices = TRUE,
+        column_title_gp = gpar(fontsize = 40),
+        column_names_gp = gpar(fontsize = 20),
+        column_gap = unit(0.5, "mm"),
+        cluster_rows = FALSE,
+        show_row_names = FALSE,
+        right_annotation = row_anno)
+
+pdf('./3-immune_clust/top10.sce.markers_cluster_dotplot_24_marked.pdf', width = 20, height = 10)
+ draw(hp3)
+ dev.off()
+ 
+ png('./3-immune_clust/top10.sce.markers_cluster_dotplot_24_marked.png',  width = 20, height = 15, res= 150, units = 'in')
+ draw(hp3)
+ dev.off()
+```
+
+```{r}
+load('./Output/Immune_subtypes_Seurat_object_by_cannanical.rds')
+#volcano plot by using scRNAtoolVis
+# find all markers 
+sce.all.immune <- SetIdent(sce.all.immune, value = sce.all.immune$celltype)
+sce.immune.markers <- FindAllMarkers(object = sce.all.immune, only.pos = F, min.pct = 0.25, 
+                              thresh.use = 0.25)
+# devtools::install_github("junjunlab/jjAnno")
+# devtools::install_github("sajuukLyu/ggunchull", type = "source")
+#devtools::install_github("junjunlab/scRNAtoolVis")
+library(scRNAtoolVis)
+vol_plot <- jjVolcano(diffData = sce.immune.markers,
+          log2FC.cutoff = 0.5,
+          #col.type = "adjustP",
+          topGeneN = 3,
+          tile.col = corrplot::COL2('PiYG', 15)[1:15],
+          size  = 5,
+          fontface = 'italic',
+          legend.position = c(0.95,0.2),
+          flip = T) 
+ggsave(plot=vol_plot, filename='./3-immune_clust/marker_gene_volcano_plot_of_each_cell_type.png', width = 20, height = 10, dpi = 300)
+```
+
+```{r}
+devtools::install_github("YuLab-SMU/DOSE")
+devtools::install_github("YuLab-SMU/HDO.db")   
+devtools::install_github('YuLab-SMU/clusterProfiler')  
+
+sce.all.immune = read_rds(file = './Output/Immune_subtypes_Seurat_object_by_cannanical.rds')
+
+#GO, KEGG, REACTOME PA
+Idents(sce.all.immune) <- sce.all.immune@meta.data$celltype
+input_sce = sce.all.immune
+remotes::install_github(repo = 'genecell/COSGR')
+library(COSG)
+table(Idents(input_sce))
+pro = 'cosg_seurat_clusters'
+  
+  if(T){
+    
+    library(COSG)
+    marker_cosg <- cosg(
+      input_sce,
+      groups='all',
+      assay='RNA',
+      slot='data',
+      mu=1,
+      n_genes_user=100)
+    
+    save(marker_cosg,file = paste0(pro,'_marker_cosg.Rdata'))
+    head(marker_cosg)
+    
+    ## Top10 genes
+    library(dplyr)  
+    top_10 <- unique(as.character(apply(marker_cosg$names,2,head,10)))
+ 
+    sce.Scale <- ScaleData(input_sce ,features = top_10)  
+    
+    DoHeatmap(sce.Scale , top_10)
+   
+    ## Top3 genes
+    top_3 <- unique(as.character(apply(marker_cosg$names,2,head,3)))
+     
+  }
+
+#go_kegg_ReactomePA_human wrapper function
+com_go_kegg_ReactomePA_human <- function(symbols_list ,pro){ 
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ReactomePA)
+  library(ggplot2)
+  library(stringr)
+  
+  # 首先全部的symbol 需要转为 entrezID
+  gcSample = lapply(symbols_list, function(y){ 
+    y=as.character(na.omit(select(org.Hs.eg.db,
+                                  keys = y,
+                                  columns = 'ENTREZID',
+                                  keytype = 'SYMBOL')[,2])
+    )
+    y
+  })
+  gcSample
+  
+  # 第1个注释是 KEGG 
+  xx <- compareCluster(geneCluster = gcSample, fun=enrichKEGG)
+  xx <- setReadable(xx, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+        
+  dotplot(xx)  + 
+    scale_y_discrete(labels=function(x) str_wrap(x, width=50)) +
+    theme(axis.text.x = element_text(size=20, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 30), 
+  	      axis.text.y = element_text(size= 20),
+         legend.title = element_text(size= 30), #change legend title font size
+        legend.text = element_text(size= 20),
+        strip.text.x = element_text(size = 20))
+  ggsave(paste0(pro,'_kegg.pdf'),width = 30,height = 20)
+  
+  # 第2个注释是 ReactomePA 
+  xx <- compareCluster(gcSample, fun="enrichPathway",
+                       organism = "human",
+                  pvalueCutoff=0.05)
+  dotplot(xx)  + 
+    scale_y_discrete(labels=function(x) str_wrap(x, width=50)) +
+    theme(axis.text.x = element_text(size=20, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 30), 
+  	      axis.text.y = element_text(size= 20),
+         legend.title = element_text(size= 30), #change legend title font size
+        legend.text = element_text(size= 20),
+        strip.text.x = element_text(size = 20))
+  ggsave(paste0(pro,'_ReactomePA.pdf'),width = 30,height = 20)
+  
+  # 然后是GO数据库的BP,CC,MF的独立注释
+  # Run full GO enrichment test for BP 
+  formula_res <- compareCluster(
+    gcSample, 
+    fun="enrichGO", 
+    OrgDb="org.Hs.eg.db",
+    ont     = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.05
+  )
+  
+  # Run GO enrichment test and merge terms 
+  # that are close to each other to remove result redundancy
+  lineage1_ego <- simplify(
+    formula_res, 
+    cutoff=0.5, 
+    by="p.adjust", 
+    select_fun=min
+  ) 
+  pdf(paste0(pro,'_GO_BP_cluster_simplified.pdf') ,width = 30,height = 20)
+  print(dotplot(lineage1_ego, showCategory=5) + 
+          scale_y_discrete(labels=function(x) str_wrap(x, width=50)) +
+          theme(axis.text.x = element_text(size=20, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 30), 
+  	      axis.text.y = element_text(size= 20),
+         legend.title = element_text(size= 30), #change legend title font size
+        legend.text = element_text(size= 20),
+        strip.text.x = element_text(size = 20)))
+  dev.off() 
+  write.csv(lineage1_ego@compareClusterResult, 
+            file=paste0(pro,'_GO_BP_cluster_simplified.csv'))
+  # Run full GO enrichment test for CC 
+  formula_res <- compareCluster(
+    gcSample, 
+    fun="enrichGO", 
+    OrgDb="org.Hs.eg.db",
+    ont     = "CC",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.05
+  )
+  
+  # Run GO enrichment test and merge terms 
+  # that are close to each other to remove result redundancy
+  lineage1_ego <- simplify(
+    formula_res, 
+    cutoff=0.5, 
+    by="p.adjust", 
+    select_fun=min
+  ) 
+  pdf(paste0(pro,'_GO_CC_cluster_simplified.pdf') ,width = 30,height = 20)
+  print(dotplot(lineage1_ego, showCategory=5) + 
+          scale_y_discrete(labels=function(x) str_wrap(x, width=50)) +
+          theme(axis.text.x = element_text(size=20, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 30), 
+  	      axis.text.y = element_text(size= 20),
+         legend.title = element_text(size= 30), #change legend title font size
+        legend.text = element_text(size= 20),
+        strip.text.x = element_text(size = 20)))
+  dev.off() 
+  write.csv(lineage1_ego@compareClusterResult, 
+            file=paste0(pro,'_GO_CC_cluster_simplified.csv'))
+  
+  # Run full GO enrichment test for MF 
+  formula_res <- compareCluster(
+    gcSample, 
+    fun="enrichGO", 
+    OrgDb="org.Hs.eg.db",
+    ont     = "MF",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.05
+  )
+  
+  # Run GO enrichment test and merge terms 
+  # that are close to each other to remove result redundancy
+  lineage1_ego <- simplify(
+    formula_res, 
+    cutoff=0.5, 
+    by="p.adjust", 
+    select_fun=min
+  ) 
+  pdf(paste0(pro,'_GO_MF_cluster_simplified.pdf') ,width = 30,height = 20)
+  print(dotplot(lineage1_ego, showCategory=5) + 
+          scale_y_discrete(labels=function(x) str_wrap(x, width=50)) +
+          theme(axis.text.x = element_text(size=20, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 30), 
+  	      axis.text.y = element_text(size= 20),
+         legend.title = element_text(size= 30), #change legend title font size
+        legend.text = element_text(size= 20),
+        strip.text.x = element_text(size = 20)))
+  dev.off() 
+  write.csv(lineage1_ego@compareClusterResult, 
+            file=paste0(pro,'_GO_MF_cluster_simplified.csv'))
+  
+}
+
+symbols_list <-  as.list(as.data.frame(apply(marker_cosg$names,2,head,100)))
+#source('com_go_kegg_ReactomePA_human.R')
+com_go_kegg_ReactomePA_human(symbols_list, pro='MCC' )
+rm(list = 'gcSample')
+```
+
+```{r}
+#trajectory analysis of CD14+ and CD16+ mono
+sce.immune.mono= sce.all.immune[,sce.all.immune$celltype  %in% c('CD14+ monocyte','CD16+ monocyte')]
+sce.immune.mono = ScaleData(sce.immune.mono)
+table(Idents(sce.immune.mono))
+
+devtools::install_github('cole-trapnell-lab/monocle3')
+library(monocle3)
+sample_ann <-  sce.immune.mono@meta.data
+sample_ann$celltype <- sce.immune.mono@meta.data$celltype
+head(sample_ann)
+# rownames(sample_ann)=sample_ann[,1]
+gene_ann <- data.frame(
+  gene_short_name = rownames(sce.immune.mono@assays$RNA) , 
+  row.names =  rownames(sce.immune.mono@assays$RNA) 
+)
+head(gene_ann)
+
+pd <- new("AnnotatedDataFrame",
+          data=sample_ann)
+fd <- new("AnnotatedDataFrame",
+          data=gene_ann)
+ct=as.data.frame(sce.immune.mono@assays$RNA@counts)
+ct[1:4,1:4]
+
+sc_cds <- new_cell_data_set(
+  as.matrix(ct), 
+  cell_metadata = sample_ann,
+  gene_metadata = gene_ann)
+sc_cds
+
+
+# sc_cds
+# sc_cds <- detectGenes(sc_cds, min_expr = 1) 
+# sc_cds <- sc_cds[fData(sc_cds)$num_cells_expressed > 10, ]
+# sc_cds
+
+cds <- sc_cds
+
+cds <- preprocess_cds(cds, num_dim = 50)
+plot_pc_variance_explained(cds)
+# 
+# BiocManager::install('DelayedArray')
+# library(DelayedArray)
+# cds <- estimateSizeFactors(cds)
+# 
+# cds <- estimateDispersions(cds) 
+
+# 并不是所有的基因都有作用，所以先进行挑选，合适的基因用来进行聚类。
+# disp_table <- dispersionTable(cds)
+# unsup_clustering_genes <- subset(disp_table, mean_expression >= 0.1)
+# cds <- setOrderingFilter(cds, unsup_clustering_genes$gene_id)
+# plot_ordering_genes(cds) 
+# plot_pc_variance_explained(cds, return_all = F) # norm_method='log'
+# 其中 num_dim 参数选择基于上面的PCA图
+cds <- reduce_dimension(cds)
+
+
+cds <- cluster_cells(cds,resolution=1e-5) 
+plot_cells(cds, label_groups_by_cluster=FALSE,  color_cells_by = "celltype")
+
+cds <- learn_graph(cds)
+
+cds <- order_cells(cds)
+
+install.packages('ragg')
+
+names(colData(cds))
+colData(cds)[,'celltype'] %>% table()
+
+get_earliest_principal_node <- function(cds, my_select="CD16+ monocyte"){
+  cell_ids <- which(colData(cds)[, "celltype"] == my_select)
+  closest_vertex <-
+  cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  root_pr_nodes <-
+  igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names
+  (which.max(table(closest_vertex[cell_ids,]))))]
+  
+  root_pr_nodes
+}
+
+cds <- order_cells(cds, root_pr_nodes=get_earliest_principal_node(cds))
+
+myselect <- function(cds,select.classify,my_select){
+  cell_ids <- which(colData(cds)[,select.classify] == my_select)
+  closest_vertex <-
+  cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  root_pr_nodes <-
+  igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names
+  (which.max(table(closest_vertex[cell_ids,]))))]
+  
+  root_pr_nodes
+}
+
+cds <- order_cells(cds, 
+                   root_pr_nodes=myselect(cds,select.classify = 'celltype',
+                                          my_select = "CD16+ monocyte")
+                   )
+mono_traj_plot = plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5)|plot_cells(cds,
+           color_cells_by = "celltype",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5)
+
+ggsave(plot=mono_traj_plot, filename='./3-immune_clust/mono_traj_plot.png', width = 20, height = 10, dpi = 300)
+
+plot_genes_in_pseudotime(cds[1:5,],
+                         color_cells_by="celltype",
+                         min_expr=0.5)
+
+save(cds,file = 'input_cds.Rdata')
+
+```
+
+```{r}
+#trajectory analysis of T cells
+T_cell_logical = str_detect(sce.all.immune@meta.data$celltype, "T cells")
+sce.immune.t = subset(sce.all.immune, idents = sce.all.immune@meta.data$celltype[T_cell_logical])
+sce.immune.t <- ScaleData(sce.immune.t)
+Idents(sce.immune.t) <- sce.immune.t@meta.data$celltype
+table(Idents(sce.immune.t))
+
+sample_ann <-  sce.immune.t@meta.data
+sample_ann$celltype <- sce.immune.t@meta.data$celltype
+head(sample_ann)
+# rownames(sample_ann)=sample_ann[,1]
+gene_ann <- data.frame(
+  gene_short_name = rownames(sce.immune.t@assays$RNA) , 
+  row.names =  rownames(sce.immune.t@assays$RNA) 
+)
+head(gene_ann)
+
+pd <- new("AnnotatedDataFrame",
+          data=sample_ann)
+fd <- new("AnnotatedDataFrame",
+          data=gene_ann)
+ct=as.data.frame(sce.immune.t@assays$RNA@counts)
+ct[1:4,1:4]
+
+sc_cds <- new_cell_data_set(
+  as.matrix(ct), 
+  cell_metadata = sample_ann,
+  gene_metadata = gene_ann)
+sc_cds
+
+
+# sc_cds
+# sc_cds <- detectGenes(sc_cds, min_expr = 1) 
+# sc_cds <- sc_cds[fData(sc_cds)$num_cells_expressed > 10, ]
+# sc_cds
+
+cds <- sc_cds
+
+cds <- preprocess_cds(cds, num_dim = 50)
+plot_pc_variance_explained(cds)
+# 
+# BiocManager::install('DelayedArray')
+# library(DelayedArray)
+# cds <- estimateSizeFactors(cds)
+# 
+# cds <- estimateDispersions(cds) 
+
+# 并不是所有的基因都有作用，所以先进行挑选，合适的基因用来进行聚类。
+# disp_table <- dispersionTable(cds)
+# unsup_clustering_genes <- subset(disp_table, mean_expression >= 0.1)
+# cds <- setOrderingFilter(cds, unsup_clustering_genes$gene_id)
+# plot_ordering_genes(cds) 
+# plot_pc_variance_explained(cds, return_all = F) # norm_method='log'
+# 其中 num_dim 参数选择基于上面的PCA图
+cds <- reduce_dimension(cds)
+
+
+cds <- cluster_cells(cds,resolution=1e-5) 
+plot_cells(cds, label_groups_by_cluster=FALSE,  color_cells_by = "celltype")
+
+cds <- learn_graph(cds)
+
+cds <- order_cells(cds)
+
+install.packages('ragg')
+
+names(colData(cds))
+colData(cds)[,'celltype'] %>% table()
+
+#function to classify root by nearest to your chosen node
+get_earliest_principal_node <- function(cds, my_select="CD8+ Effector T cells"){
+  cell_ids <- which(colData(cds)[, "celltype"] == my_select)
+  closest_vertex <-
+  cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  root_pr_nodes <-
+  igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names
+  (which.max(table(closest_vertex[cell_ids,]))))]
+  
+  root_pr_nodes
+}
+
+cds <- order_cells(cds, root_pr_nodes=get_earliest_principal_node(cds))
+
+myselect <- function(cds,select.classify,my_select){
+  cell_ids <- which(colData(cds)[,select.classify] == my_select)
+  closest_vertex <-
+  cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  root_pr_nodes <-
+  igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names
+  (which.max(table(closest_vertex[cell_ids,]))))]
+  
+  root_pr_nodes
+}
+
+cds <- order_cells(cds, 
+                   root_pr_nodes=myselect(cds,select.classify = 'celltype',
+                                          my_select = "CD8+ Effector T cells")
+                   )
+t_cell_traj_plot = plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5)|plot_cells(cds,
+           color_cells_by = "celltype",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5)
+ggsave(plot=t_cell_traj_plot, filename='./3-immune_clust/t_cell_traj_plot.png', width = 20, height = 10, dpi = 300)
+
+plot_genes_in_pseudotime(cds[1:5,],
+                         color_cells_by="celltype",
+                         min_expr=0.5)
+
+save(cds,file = 'input_cds.Rdata')
+
+```
+
+
+```{r}
+library(testthat)
+library(grid)
+#T cell DEGs
+Idents(sce.all.immune) = sce.all.immune@meta.data$celltype
+T_cell_logical = str_detect(sce.all.immune@meta.data$celltype, "T cells")
+imm_t = subset(sce.all.immune, idents = sce.all.immune@meta.data$celltype[T_cell_logical])
+imm_t <- ScaleData(imm_t)
+Idents(imm_t) <- imm_t@meta.data$celltype
+
+#heatmap of t cell subclusters expression with top 10 marker genes
+source('DoMultiBarHeatmap.R')
+t_markers <- FindAllMarkers(imm_t, only.pos = T, min.pct = 0.25, min.diff.pct = 0.25)
+
+top_t_markers <- t_markers %>% group_by(cluster) %>% top_n(10, wt = avg_log2FC)
+
+use_colors <- c(PBMC_ARD614 = "#B40F20",
+  PBMC_EarlyD27 = "seagreen",
+  PBMC_Pre = "darkgoldenrod2",
+  PBMC_RespD376 = "steelblue",
+  )
+imm_t@meta.data$group = as.factor(imm_t@meta.data$group)
+imm_t@meta.data$celltype = as.factor(imm_t@meta.data$celltype)
+
+DoMultiBarHeatmap(imm_t, features = top_t_markers$gene, group.by = "celltype", additional.group.by = "group", additional.group.sort.by = "group", draw.lines = F) +
+  scale_fill_viridis() 
+  
+#each T cell sub type for each disease condition
+#devtools::install_github("xmc811/Scillus", ref = "development")
+library(Scillus)
+plot_heatmap(dataset = imm_t, 
+              markers = top_t_markers$gene,
+              sort_var = c("celltype","group"),
+              anno_var = c("celltype","group"),
+              anno_colors = list("Set2",                                             # RColorBrewer palette
+                                 c("red","orange","yellow","purple","blue","green"), # color vector
+                                 "Reds",
+                                 c("blue","white","red"),                            # Three-color gradient
+                                 "Greens"))
+
+#must change value of seurat_cluster ion order to display cell type
+imm_t@meta.data$seurat_clusters = imm_t@meta.data$celltype
+t_cell_plot = plot_stat(dataset = imm_t, plot_type = "prop_fill", group_by = "group") +
+  guides(fill=guide_legend(title="Cell type")) +
+  theme(axis.text.x = element_text(size=10, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 20), 
+  	      axis.text.y = element_text(size= 10),
+         legend.title = element_text(size= 20), #change legend title font size
+        legend.text = element_text(size= 14)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold", size = 30)) +
+  ggtitle('T Cell subtypes Composition Before And After Treatment')
+ggsave(plot=t_cell_plot, filename='./3-immune_clust/T_Cell_subtypes_Composition_Before_And _After_Treatment.png', width = 20, height = 10, dpi = 300)
+##before treatment most CD4, almost no CD8 cytotoxic; early has lots of CD8 effector; after 37 days post treatment lots of CD8 cytotoxic, but relaps exausts CD8 effector (short-life), reduce prop of CD8 cytotoxic aand form more CD4 
+```
+
+```{r}
+###T cell signatures
+library(readxl)
+T_exhausted <- read_excel("CD8_T_cells_exhausted.xlsx", skip = 1)
+cytotoxicity <- c("PRF1", "IFNG", "GNLY", "NKG7", "GZMB", "GZMA", "GZMH", "KLRK1", "KLRB1", "KLRD1", "CTSW", "CST7")
+
+T_cell_markers <- list(T_exhausted$GeneSymbol, cytotoxicity)
+
+imm_t <- AddModuleScore(imm_t, features = T_cell_markers, name = c("exhaustion", "cytotoxicity"), nbin = 12)
+
+FeaturePlot(imm_t, features = c("cytotoxicity2", "exhaustion1"))
+
+#violin plot of T cell 
+t_cell_score_vln_plot = VlnPlot(imm_t, features = c("cytotoxicity2", "exhaustion1"), pt.size = 0, group.by = "celltype", cols =  brewer.pal(8, "Paired"), idents = c('CD4+ T cells', 'CD8+ cytotoxic T cells', 'CD8+ Effector T cells'), ncol = 1) +
+  guides(fill=guide_legend(title="Cell type")) +
+  theme(axis.text.x = element_text(size=10, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 20), 
+  	      axis.text.y = element_text(size= 10))
+
+ggsave(plot=t_cell_score_vln_plot, filename='./3-immune_clust/T_Cell_subtypes_signature.png', width = 20, height = 10, dpi = 300)
+
+```
+
+```{r}
+t.exp.matrix <- as.data.frame(imm_t@assays$RNA@data)
+t.exp.matrix2<-t(t.exp.matrix) %>% as.data.frame()
+t.exp.matrix2[,1]<-imm_t$celltype
+colnames(t.exp.matrix2)[1] <- "celltype"
+
+t.exp.matrix2[,ncol(t.exp.matrix2)+1]<-imm_t$group
+colnames(t.exp.matrix2)[ncol(t.exp.matrix2)] <- "group"
+
+top_t_markers <- t_markers %>% group_by(cluster) %>% top_n(10, wt = avg_log2FC)
+t.exp.matrix2[,]
+
+#绘图
+library(ggplot2)
+p1<- ggplot2::ggplot(t.exp.matrix2,aes(x=celltype,y=LTB,fill=group))+
+  geom_boxplot(alpha=0.7)+
+  scale_y_continuous(name = "Expression")+
+  scale_x_discrete(name="Celltype")+
+  scale_fill_manual(values = c('DeepSkyBlue','Orange','pink','green'))+
+  theme(axis.text.x = element_text(size=15, angle = 45, vjust = 1, hjust=1),
+        axis.title = element_text(size = 20), 
+        axis.text.y = element_text(size=15),
+        legend.title = element_text(size=12), #change legend title font size
+        legend.text = element_text(size=10)) +
+  theme(plot.title = element_text(size=20, hjust=0, face="bold")) +
+  ggtitle()
+p1
+
+```
+
+```{r}
+#mono DEGs
+mono_cell_logical = str_detect(sce.all.immune@meta.data$celltype, "mono")
+imm_mono = subset(sce.all.immune, idents = sce.all.immune@meta.data$celltype[mono_cell_logical])
+imm_mono <- ScaleData(imm_mono)
+Idents(imm_mono) <- imm_mono@meta.data$celltype
+
+#heatmap of monocyte subclusters expression with top 10 marker genes
+source('DoMultiBarHeatmap.R')
+mono_markers <- FindAllMarkers(imm_mono, only.pos = T, min.pct = 0.25, min.diff.pct = 0.25)
+
+top_mono_markers <- mono_markers %>% group_by(cluster) %>% top_n(10, wt = avg_log2FC)
+
+imm_mono@meta.data$group = as.factor(imm_mono@meta.data$group)
+imm_mono@meta.data$celltype = as.factor(imm_mono@meta.data$celltype)
+
+DoMultiBarHeatmap(imm_mono, features = top_mono_markers$gene, group.by = "celltype", additional.group.by = "group", additional.group.sort.by = "group", draw.lines = F) +
+  scale_fill_viridis() 
+  
+#each monocyte sub type for each disease condition
+library(Scillus)
+plot_heatmap(dataset = imm_mono, 
+              markers = top_mono_markers$gene,
+              sort_var = c("celltype","group"),
+              anno_var = c("celltype","group"),
+              anno_colors = list("Set2",                                             # RColorBrewer palette
+                                 c("red","orange","yellow","purple","blue","green"), # color vector
+                                 "Reds",
+                                 c("blue","white","red"),                            # Three-color gradient
+                                 "Greens"))
+
+#must change value of seurat_cluster ion order to display cell type
+imm_mono@meta.data$seurat_clusters = imm_mono@meta.data$celltype
+mono_cell_plot = plot_stat(dataset = imm_mono, plot_type = "prop_fill", group_by = "group") +
+  guides(fill=guide_legend(title="Cell type")) +
+  theme(axis.text.x = element_text(size=10, vjust = 1, hjust=1, angle = 45),
+         axis.title = element_text(size = 20), 
+  	      axis.text.y = element_text(size= 10),
+         legend.title = element_text(size= 20), #change legend title font size
+        legend.text = element_text(size= 14)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold", size = 30)) +
+  ggtitle('Monocyte Subtypes Composition Before And After Treatment')
+ggsave(plot=mono_cell_plot, filename='./3-immune_clust/Monocyte_Subtypes_Composition_ Before_And_After_Treatment.png', width = 20, height = 10, dpi = 300)
+## majority CD14 mono (Classic) as expected as phagocytic, but early post treatment illustrated a increase prop of non-classical CD16 pro-inflammatory; long after treatment non-classical diminished; increased a bit when relaps
+
+```
